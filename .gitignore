@@ -1,4 +1,6 @@
 Declarations.txt
-extract_text_markitdown.ipynb
-RAG_Application.py
 .ipynb_checkpoints
+.dockerignore
+.vscode
+test
+chroma

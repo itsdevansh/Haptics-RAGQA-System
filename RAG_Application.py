@@ -1,9 +1,7 @@
 import gradio as gr
 import torch
 from typing import List, Dict
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from langchain import LLMChain, PromptTemplate
-from langchain_huggingface import HuggingFacePipeline
 import chromadb
 from chromadb.config import Settings, DEFAULT_TENANT, DEFAULT_DATABASE
 import os
@@ -11,9 +9,12 @@ from openai import OpenAI
 import anthropic
 from gtts import gTTS
 import tempfile
-import pygame
 from pathlib import Path
 from langchain.llms import Ollama
+import pygame
+import PyPDF2
+import shutil
+from typing import List, Tuple
 
 # Device setup if MacOS
 if torch.backends.mps.is_available():
@@ -295,6 +296,64 @@ def process_query_and_clear(message: str) -> tuple[str, str, str, str, str]:
     context, rag_response, claude_response, gpt_response = process_query(message)
     return context, rag_response, claude_response, gpt_response, ""
 
+def process_uploaded_pdf(files) -> str:
+    """Process uploaded PDF files and add them to ChromaDB."""
+    try:
+        uploaded_files = []
+        for file in files:
+            if file.name.endswith('.pdf'):
+                # Process the PDF and get text chunks
+                text_chunks = process_pdf(file.name)
+                
+                # Add to ChromaDB
+                for i, chunk in enumerate(text_chunks):
+                    collection.add(
+                        documents=[chunk],
+                        metadatas=[{"source": f"{file.name}_chunk_{i}"}],
+                        ids=[f"pdf_chunk_{file.name}_{i}"]
+                    )
+                uploaded_files.append(file.name)
+        
+        if uploaded_files:
+            return f"Successfully processed PDFs: {', '.join(uploaded_files)}"
+        return "No valid PDF files uploaded"
+    except Exception as e:
+        return f"Error processing PDFs: {str(e)}"
+
+def process_pdf(file_path: str) -> List[str]:
+    """Extract text from PDF and split into chunks."""
+    chunks = []
+    try:
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            for page in pdf_reader.pages:
+                text = page.extract_text()
+                # Split into smaller chunks
+                chunks.extend(split_into_chunks(text))
+    except Exception as e:
+        print(f"Error processing PDF {file_path}: {str(e)}")
+    return chunks
+
+def split_into_chunks(text: str, chunk_size: int = 1000) -> List[str]:
+    """Split text into chunks of approximately equal size."""
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    for word in words:
+        if current_size + len(word) > chunk_size:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = [word]
+            current_size = len(word)
+        else:
+            current_chunk.append(word)
+            current_size += len(word) + 1
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
 
 ## Rasheeq and Devansh Both created the UI, equal contribution creating textboxes, fixing the length for better experience and adding send and clear button, plus the buttons to call the text to speech.
 """
@@ -303,6 +362,18 @@ Following section is the creating of web UI using gradio library
 with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
     gr.Markdown("# Llama 3.2 Haptics QA System")
     gr.Markdown("Ask questions about Haptics and compare responses from different models.")
+    
+    # Add PDF upload section
+    with gr.Row():
+        file_output = gr.File(
+            file_count="multiple",
+            file_types=[".pdf"],
+            label="Upload PDF Files"
+        )
+        upload_button = gr.Button("Process PDFs")
+    upload_status = gr.Textbox(label="Upload Status", interactive=False)
+    
+    # Existing query interface
     with gr.Row():
         input_text = gr.Textbox(
             label="Enter your question:",
@@ -405,6 +476,12 @@ with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
     )
     clear_btn.click(lambda: "", inputs=[], outputs=[input_text])
 
+    # Add upload button click handler
+    upload_button.click(
+        process_uploaded_pdf,
+        inputs=[file_output],
+        outputs=[upload_status]
+    )
 
 # Cleanup function for temporary audio files
 def cleanup_temp_audio():
