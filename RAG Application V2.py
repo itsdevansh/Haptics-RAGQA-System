@@ -1,6 +1,7 @@
 import gradio as gr
 import torch
-from typing import List, Dict, Union, Set
+from typing import List, Dict, Union, Set, Optional, Tuple
+from langchain import LLMChain, PromptTemplate
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from langchain import LLMChain, PromptTemplate
 from langchain_huggingface import HuggingFacePipeline
@@ -19,8 +20,14 @@ from langchain.llms import Ollama
 from langchain_ollama import OllamaLLM
 from markitdown import MarkItDown
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import logging
+from dataclasses import dataclass
 import tempfile
-
+from functools import lru_cache
+from dotenv import load_dotenv
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+load_dotenv()
 # Device setup if MacOS
 if torch.backends.mps.is_available():
     device = torch.device("mps")
@@ -29,211 +36,317 @@ else:
     device = 'cpu'
     print('cpu is used.')
 
-# Constants for file and database names
-PDF_TRACKER_FILE = "processed_pdfs.json"
-DATABASE_NAME = "haptics_research"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+@dataclass
+class Config:
+    """Configuration class for application settings."""
+    PDF_TRACKER_FILE: str = "processed_pdfs.json"
+    DATABASE_NAME: str = "haptics_research"
+    CHUNK_SIZE: int = 1000
+    CHUNK_OVERLAP: int = 200
+    TOP_K_RESULTS: int = 3
+    SUPPORTED_EXTENSIONS: tuple = ('.pptx', '.docx', '.pdf')
 
-def load_processed_pdfs() -> Set[str]:
-    """
-    Load the list of previously processed PDFs from JSON file.
-    Returns a set of processed PDF filenames.
-    """
-    try:
-        if os.path.exists(PDF_TRACKER_FILE):
-            with open(PDF_TRACKER_FILE, 'r') as f:
-                return set(json.load(f))
-        return set()
-    except Exception as e:
-        print(f"Error loading PDF tracker: {e}")
-        return set()
+class DeviceManager:
+    """Manages device selection for torch operations."""
+    @staticmethod
+    def get_device() -> str:
+        if torch.backends.mps.is_available():
+            logger.info('Using MPS device')
+            return torch.device("mps")
+        logger.info('Using CPU device')
+        return 'cpu'
 
-def save_processed_pdfs(processed_pdfs: Set[str]) -> None:
-    """
-    Save the updated list of processed PDFs to JSON file.
-    """
-    try:
-        with open(PDF_TRACKER_FILE, 'w') as f:
-            json.dump(list(processed_pdfs), f)
-    except Exception as e:
-        print(f"Error saving PDF tracker: {e}")
+class PDFTracker:
+    """Manages tracking of processed PDFs."""
+    def __init__(self, config: Config):
+        self.config = config
+        self.processed_pdfs: Set[str] = set()
+        self.load_processed_pdfs()
 
-def initialize_database():
-    """
-    Initialize ChromaDB with the specified database name.
-    Creates the database if it doesn't exist.
-    """
-    try:
-        client = chromadb.PersistentClient(
-            path=f"./{DATABASE_NAME}",  # Specify the database path
-            settings=Settings(
-                allow_reset=True,
-                is_persistent=True
-            ),
-            tenant=DEFAULT_TENANT,
+    def load_processed_pdfs(self) -> None:
+        """Load the list of previously processed PDFs from JSON file."""
+        try:
+            if os.path.exists(self.config.PDF_TRACKER_FILE):
+                with open(self.config.PDF_TRACKER_FILE, 'r') as f:
+                    self.processed_pdfs = set(json.load(f))
+        except Exception as e:
+            logger.error(f"Error loading PDF tracker: {e}")
+
+    def save_processed_pdfs(self) -> None:
+        """Save the updated list of processed PDFs to JSON file."""
+        try:
+            with open(self.config.PDF_TRACKER_FILE, 'w') as f:
+                json.dump(list(self.processed_pdfs), f)
+        except Exception as e:
+            logger.error(f"Error saving PDF tracker: {e}")
+
+class DatabaseManager:
+    """Manages ChromaDB operations."""
+    def __init__(self, config: Config):
+        self.config = config
+        self.client, self.collection = self._initialize_database()
+
+    def _initialize_database(self):
+        """Initialize ChromaDB with specified database name."""
+        try:
+            client = chromadb.PersistentClient(
+                path=f"./{self.config.DATABASE_NAME}",
+                settings=Settings(
+                    allow_reset=True,
+                    is_persistent=True
+                )
+            )
+            
+            try:
+                collection = client.get_collection(name="research_papers")
+            except Exception:
+                collection = client.create_collection(name="research_papers")
+                
+            return client, collection
+        except Exception as e:
+            logger.error(f"Error initializing database: {e}")
+            raise
+
+    @staticmethod
+    def normalize_for_comparison(text: str) -> str:
+        """Normalize text for comparison."""
+        return ''.join(char.lower() for char in text if not char.isspace() and char.isalnum())
+
+    def query_chroma(self, query: str) -> List[Dict[str, any]]:
+        """Query the Chroma database and return unique most relevant results."""
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=self.config.TOP_K_RESULTS * 5
         )
         
-        # Try to get or create the collection
-        try:
-            collection = client.get_collection(name="research_papers")
-        except Exception:
-            collection = client.create_collection(name="research_papers")
-            
-        return client, collection
-    except Exception as e:
-        print(f"Error initializing database: {e}")
-        raise
-
-
-llm = Ollama(
-    model="llama3.2:latest",  # Use the exact model name from `ollama list`
-    base_url="http://127.0.0.1:11434",  # Default Ollama server URL ######PASTE YOUR OLLAMA URL 
-)
-
-from typing import List
-import os
-import tempfile
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-def process_pdf(uploaded_file: Union[str, bytes, object]) -> List[str]:
-    """
-    Process uploaded document files (PDF, PPTX, DOCX) and return list of text chunks.
-    
-    Args:
-        uploaded_file: Can be a file path (str), bytes content, or file-like object
+        formatted_results = []
+        seen_normalized_texts = set()
         
-    Returns:
-        List[str]: List of text chunks from the document
-    """
-    # Define supported file extensions
-    supported_extensions = ('.pptx', '.docx', '.pdf')
-    
-    # Handle different input types
-    if isinstance(uploaded_file, str):
-        # If it's a file path
-        file_ext = os.path.splitext(uploaded_file)[1].lower()
-        file_name = os.path.basename(uploaded_file)
-        file_content = open(uploaded_file, 'rb').read()
-    elif isinstance(uploaded_file, bytes):
-        # If it's bytes content
-        file_name = "document.pdf"  # Default name
-        file_ext = '.pdf'  # Default extension
-        file_content = uploaded_file
-    else:
-        # If it's a file-like object
-        file_name = getattr(uploaded_file, 'name', 'document.pdf')
-        file_ext = os.path.splitext(file_name)[1].lower()
-        try:
-            file_content = uploaded_file.read()
-        except AttributeError:
-            file_content = str(uploaded_file).encode()
+        for i in range(len(results['ids'][0])):
+            current_text = results['documents'][0][i]
+            normalized_text = self.normalize_for_comparison(current_text)
+            
+            if normalized_text not in seen_normalized_texts:
+                seen_normalized_texts.add(normalized_text)
+                formatted_results.append({
+                    'id': results['ids'][0][i],
+                    'text': current_text,
+                    'distance': results['distances'][0][i]
+                })
+                
+            if len(formatted_results) == self.config.TOP_K_RESULTS:
+                break
+                
+        return formatted_results
 
-    # Validate file extension
-    if not file_ext.endswith(supported_extensions):
-        raise ValueError(f"Unsupported file type. Supported types are: {supported_extensions}")
-
-    # Initialize MarkItDown with Ollama client    
-    client = OllamaLLM(model="llama3.2-vision:latest")
-    md = MarkItDown(llm_client=client)
-
-    # Save content to temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-        temp_file.write(file_content)
-        temp_file_path = temp_file.name
-
-    try:
-        # Convert document to markdown using MarkItDown
-        print(f"\nConverting {file_name}...")
-        result = md.convert(temp_file_path)
-        text = result.text_content
-
-        # Split text into chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+class DocumentProcessor:
+    """Handles document processing operations."""
+    def __init__(self, config: Config):
+        self.config = config
+        self.llm_client = OllamaLLM(model="llama3.2-vision:latest")
+        self.md = MarkItDown(llm_client=self.llm_client)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP,
             length_function=len,
         )
-        chunks = text_splitter.split_text(text)
+
+    def process_document(self, uploaded_file: Union[str, bytes, object]) -> List[str]:
+        """Process uploaded document files and return list of text chunks."""
+        file_info = self._get_file_info(uploaded_file)
         
-        print(f"Successfully converted {file_name}")
-        return chunks
+        if not file_info['ext'].endswith(self.config.SUPPORTED_EXTENSIONS):
+            raise ValueError(f"Unsupported file type. Supported types are: {self.config.SUPPORTED_EXTENSIONS}")
 
-    except Exception as e:
-        print(f"Error converting {file_name}: {str(e)}")
-        raise
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_info['ext']) as temp_file:
+            temp_file.write(file_info['content'])
+            temp_file_path = temp_file.name
 
-    finally:
-        # Clean up temporary file
-        os.unlink(temp_file_path)
+        try:
+            logger.info(f"Converting {file_info['name']}...")
+            result = self.md.convert(temp_file_path)
+            chunks = self.text_splitter.split_text(result.text_content)
+            logger.info(f"Successfully converted {file_info['name']}")
+            return chunks
+        except Exception as e:
+            logger.error(f"Error converting {file_info['name']}: {str(e)}")
+            raise
+        finally:
+            os.unlink(temp_file_path)
 
+    @staticmethod
+    def _get_file_info(uploaded_file: Union[str, bytes, object]) -> Dict:
+        """Extract file information from uploaded file."""
+        if isinstance(uploaded_file, str):
+            return {
+                'name': os.path.basename(uploaded_file),
+                'ext': os.path.splitext(uploaded_file)[1].lower(),
+                'content': open(uploaded_file, 'rb').read()
+            }
+        elif isinstance(uploaded_file, bytes):
+            return {
+                'name': "document.pdf",
+                'ext': '.pdf',
+                'content': uploaded_file
+            }
+        else:
+            name = getattr(uploaded_file, 'name', 'document.pdf')
+            return {
+                'name': name,
+                'ext': os.path.splitext(name)[1].lower(),
+                'content': uploaded_file.read() if hasattr(uploaded_file, 'read') else str(uploaded_file).encode()
+            }
 
-def add_chunks_to_collection(chunks: List[str], collection: chromadb.Collection) -> None:
-    """
-    Add text chunks to ChromaDB collection.
-    """
-    # Generate IDs for chunks
-    chunk_ids = [f"chunk_{i}" for i in range(len(chunks))]
-    
-    # Add chunks to collection
-    collection.add(
-        documents=chunks,
-        ids=chunk_ids,
-    )
-
-
-
-def normalize_for_comparison(text: str) -> str:
-    """
-    Normalize text for comparison by removing all whitespace and punctuation.
-    """
-    # Remove all whitespace, punctuation, and convert to lowercase
-    return ''.join(char.lower() for char in text if not char.isspace() and char.isalnum())
-
-def query_chroma(query: str, collection: chromadb.Collection, top_k: int = 3) -> List[Dict[str, any]]:
-    """
-    Query the Chroma database and return top_k in this case 3, unique most relevant results.
-    Handles cases where texts might be formatted differently but contain the same content.
-    Specifically handles whitespace variations and minor formatting differences.
-    """
-    # Query with more results than needed to account for duplicates
-    results = collection.query(
-        query_texts=[query],
-        n_results=top_k * 5  # Request more results to ensure enough unique entries after filtering
-    )
-    
-    # Create a list to track processed results
-    formatted_results = []
-    # Track normalized versions of added texts
-    seen_normalized_texts = set()
-    
-    # Process results and remove similar entries
-    for i in range(len(results['ids'][0])):
-        current_text = results['documents'][0][i]
-        normalized_text = normalize_for_comparison(current_text)
+class HapticsQA:
+    """Main class for the Haptics QA system."""
+    def __init__(self):
+        self.config = Config()
+        self.device = DeviceManager.get_device()
+        self.pdf_tracker = PDFTracker(self.config)
+        self.db_manager = DatabaseManager(self.config)
+        self.doc_processor = DocumentProcessor(self.config)
+        self.llm = self._initialize_llm()
+        self._setup_chains()
+        self.openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        self.anthropic_client = anthropic.Client(api_key=os.getenv('ANTHROPIC_API_KEY'))
         
-        # Skip if we've seen this normalized text before
-        if normalized_text not in seen_normalized_texts:
-            seen_normalized_texts.add(normalized_text)
-            formatted_results.append({
-                'id': results['ids'][0][i],
-                'text': current_text,  # Keep original formatting for display
-                'distance': results['distances'][0][i]
-            })
+        # Initialize additional chains
+        self._setup_enhanced_chain()
+
+    def _initialize_llm(self):
+        """Initialize the language model."""
+        return Ollama(
+            model="llama3.2:latest",
+            base_url="http://127.0.0.1:11434",
+        )
+    def _setup_enhanced_chain(self):
+        """Set up the enhanced RAG chain."""
+        enhance_rag_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        You are a haptics domain researcher instructed to answer the user question in max 3 lines in the tone of a research paper. 
+        Your task is to write a small answer to the given question with respect to Haptics. 
+        It must be concise 2-line answer that captures the core information need. 
+        Focus on the key technical concepts and terminology.
+        <|eot_id|><|start_header_id|>user<|end_header_id|>
+        {query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+        
+        self.enhance_prompt = PromptTemplate(
+            template=enhance_rag_template,
+            input_variables=["query"]
+        )
+        self.enhance_chain = LLMChain(
+            prompt=self.enhance_prompt,
+            llm=self.llm,
+            verbose=False
+        )
+    async def process_enhanced_query(self, message: str) -> Tuple[str, str]:
+        """Process query using enhanced RAG approach."""
+        try:
+            # Generate reference answer
+            llm_generated_reference = self.enhance_chain.run(query=message)
+            logger.info(f"Generated reference: {llm_generated_reference}")
             
-        # Break if we have enough unique results
-        if len(formatted_results) == top_k:
-            break
+            # Query database with enhanced prompt
+            results = self.db_manager.query_chroma(llm_generated_reference)
+            context = self._format_context(results)
             
-    return formatted_results
+            # Generate final response
+            response = self.standard_chain.run(
+                query=message,
+                context=context
+            )
+            cleaned_response = self._clean_response(response)
+            
+            return context, cleaned_response
+        except Exception as e:
+            logger.error(f"Error in enhanced query processing: {e}")
+            error_message = f"An error occurred: {str(e)}"
+            return error_message, error_message
 
-def format_context(results: List[Dict[str, any]]) -> str:
-    """Format the ChromaDB results into a string context."""
-    context_parts = []
-    for i, result in enumerate(results, 1):
-        context_parts.append(f"{i}. {result['text']}")
-    return "\n\n".join(context_parts)
+    async def process_gpt_query(self, message: str, context: str) -> str:
+        """Process query using GPT model."""
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert in haptics technology. Use the provided context to answer questions accurately and concisely."},
+                    {"role": "user", "content": f"Context: {context}\n\nQuestion: {message}"}
+                ],
+                temperature=0.7,
+                max_tokens=500
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Error in GPT query processing: {e}")
+            return f"An error occurred: {str(e)}"
 
+    async def process_claude_query(self, message: str, context: str) -> str:
+        """Process query using Claude model."""
+        try:
+            response = self.anthropic_client.messages.create(
+                model="claude-3-opus-20240229",
+                max_tokens=500,
+                messages=[{
+                    "role": "user",
+                    "content": f"Context: {context}\n\nQuestion: {message}\n\nProvide a clear and concise answer based on the context provided."
+                }]
+            )
+            return response.content[0].text
+        except Exception as e:
+            logger.error(f"Error in Claude query processing: {e}")
+            return f"An error occurred: {str(e)}"
+    def handle_pdf_upload(self, pdf_files) -> str:
+        """Handle PDF file uploads."""
+        try:
+            newly_processed = set()
+            total_chunks = 0
+            skipped_files = 0
+            
+            for pdf_file in pdf_files:
+                filename = Path(pdf_file.name).name
+                if filename in self.pdf_tracker.processed_pdfs:
+                    skipped_files += 1
+                    continue
+                    
+                chunks = self.doc_processor.process_document(pdf_file)
+                self._add_chunks_to_collection(chunks)
+                total_chunks += len(chunks)
+                newly_processed.add(filename)
+            
+            self.pdf_tracker.processed_pdfs.update(newly_processed)
+            self.pdf_tracker.save_processed_pdfs()
+            
+            return self._generate_upload_status(len(newly_processed), total_chunks, skipped_files)
+        except Exception as e:
+            logger.error(f"Error processing PDFs: {str(e)}")
+            return f"Error processing PDFs: {str(e)}"
 
-standard_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+    def _add_chunks_to_collection(self, chunks: List[str]) -> None:
+        """Add text chunks to ChromaDB collection."""
+        chunk_ids = [f"chunk_{i}" for i in range(len(chunks))]
+        self.db_manager.collection.add(
+            documents=chunks,
+            ids=chunk_ids,
+        )
+
+    @staticmethod
+    def _generate_upload_status(new_files: int, total_chunks: int, skipped_files: int) -> str:
+        """Generate upload status message."""
+        status_parts = []
+        if new_files:
+            status_parts.append(f"Successfully processed {new_files} new PDF(s). Added {total_chunks} text chunks to the database.")
+        if skipped_files > 0:
+            status_parts.append(f"Skipped {skipped_files} previously processed file(s).")
+        return " ".join(status_parts) or "No new files to process."
+
+    def _setup_chains(self):
+        """Set up the LLM chains for processing queries."""
+        standard_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 You are an expert AI assistant specializing in haptics domain, tasked with providing accurate, concise responses.
 Explain concepts using the context like i am a 15 year old.
 Offer clear, direct explanations of key haptic concepts.
@@ -244,210 +357,418 @@ The context is  you need to derive your answer from =
 The question is =
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 {query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>Your Answer = """
-
-standard_prompt = PromptTemplate(template=standard_template, input_variables=["query", "context"])
-standard_chain = LLMChain(prompt=standard_prompt, llm=llm, verbose=False)
-
-# Initialize ChromaDB client
-# client = chromadb.PersistentClient(
-#     settings=Settings(),
-#     tenant=DEFAULT_TENANT,
-#     database=DEFAULT_DATABASE
-# )
-# collection = client.get_collection(name="research_papers")
-
-def clean_response(response: str) -> str:
-    """Clean the response to show only the generated answer."""
-    # First find everything after "The question is ="
-    if "The question is =" in response:
-        response = response.split("The question is =")[1]
         
-    # Remove any remaining system markers
-    markers = [
-        "<|begin_of_text|>",
-        "<|start_header_id|>",
-        "<|end_header_id|>",
-        "<|eot_id|>",
-        "system",
-        "user",
-        "assistant",
-        "Your Answer ="
-    ]
-    
-    cleaned = response
-    for marker in markers:
-        cleaned = cleaned.replace(marker, "")
-    
-    # Remove any lines containing unwanted phrases
-    cleaned = "\n".join([line for line in cleaned.split('\n') 
-    if not any(x in line.lower() for x in ["date:", "cutting", "today"])])
-    
-    # Final cleanup
-    cleaned = cleaned.strip()
-    
-    return cleaned
+        self.standard_prompt = PromptTemplate(
+            template=standard_template, 
+            input_variables=["query", "context"]
+        )
+        self.standard_chain = LLMChain(
+            prompt=self.standard_prompt, 
+            llm=self.llm, 
+            verbose=False
+        )
 
-
-def enchanced_rag(message: str) -> str:
-    """Enhanced RAG approach: LLM generating small rewriting before vector search."""
-
-    enhance_rag_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-    You are a haptics domain researcher instructed to answer the user question in max 3 lines in the tone of a research paper. Your task is to write a small answer to the given question with respect to Haptics. It must be concise 2-line answer that captures the core information need. Focus on the key technical concepts and terminology.
-    <|eot_id|><|start_header_id|>user<|end_header_id|>
-    {query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
-    enhance_rag_prompt = PromptTemplate(template=enhance_rag_template, input_variables=["query"])
-    enhance_rag_chain = LLMChain(prompt=enhance_rag_prompt, llm=llm, verbose=False)
-
-    try:
-        llm_generated_reference_answer = enhance_rag_chain.run(query=message)
-        print(f"llm_generated_reference_answer: {llm_generated_reference_answer}")
+    def _clean_response(self, response: str) -> str:
+        """Clean the response to show only the generated answer."""
+        if "The question is =" in response:
+            response = response.split("The question is =")[1]
+            
+        markers = [
+            "<|begin_of_text|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|eot_id|>",
+            "system",
+            "user",
+            "assistant",
+            "Your Answer ="
+        ]
         
-        results = query_chroma(llm_generated_reference_answer, collection)
-        context = format_context(results)
+        cleaned = response
+        for marker in markers:
+            cleaned = cleaned.replace(marker, "")
         
-        response = standard_chain.run(query=message, context=context)
-        return clean_response(response)
-    except Exception as e:
-        return f"An error occurred: {str(e)}"
-
-
-
-
-def process_query(message: str) -> tuple[str, str, str, str]:
-    """Process the query and return context and responses from all models."""
-    try:
-        # Get context and RAG response
-        results = query_chroma(message, collection)
-        context = format_context(results)
-        rag_response = standard_chain.run(query=message, context=context)
-        # enchanced_rag_reponse = enchanced_rag(message)   #this is the enhanced rag approach, we didn't implement it in the user study prototype as its resource intensive
-        cleaned_rag_response = clean_response(rag_response)
-
-        return context, cleaned_rag_response
-    except Exception as e:
-        error_message = f"An error occurred: {str(e)}"
-        return error_message, error_message, error_message, error_message
-
-def process_query_and_clear(message: str) -> tuple[str, str, str, str, str]:
-    """Process the query and return context, responses from all models, and empty string to clear input."""
-    context, rag_response = process_query(message)
-    return context, rag_response, ""
-def handle_pdf_upload(pdf_files) -> str:
-    """
-    Handle uploaded PDF files and add their content to the database.
-    Checks if files were previously processed and only processes new ones.
-    Returns a status message.
-    """
-    try:
-        # Load the set of previously processed PDFs
-        processed_pdfs = load_processed_pdfs()
+        cleaned = "\n".join([line for line in cleaned.split('\n') 
+            if not any(x in line.lower() for x in ["date:", "cutting", "today"])])
         
-        # Track new files processed in this session
-        newly_processed = set()
-        total_chunks = 0
-        skipped_files = 0
+        return cleaned.strip()
+
+    def _format_context(self, results: List[Dict[str, any]]) -> str:
+        """Format the ChromaDB results into a string context."""
+        context_parts = []
+        for i, result in enumerate(results, 1):
+            context_parts.append(f"{i}. {result['text']}")
+        return "\n\n".join(context_parts)
+
+    async def process_query(self, message: str) -> Tuple[str, str]:
+        """Process the query and return context and response asynchronously."""
+        # Create ThreadPoolExecutor for running synchronous code
+        executor = ThreadPoolExecutor(max_workers=3)
+        try:
+            results = self.db_manager.query_chroma(message)
+            context = self._format_context(results)
+            
+            # Convert synchronous LLMChain.run to async
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.standard_chain.run(
+                    query=message,
+                    context=context
+                )
+            )
+            cleaned_response = self._clean_response(response)
+            
+            return context, cleaned_response
+        except Exception as e:
+            logger.error(f"Error processing query: {e}")
+            error_message = f"An error occurred: {str(e)}"
+            return error_message, error_message
+
+# def create_gradio_interface(qa_system: HapticsQA):
+#     """Create and configure the Gradio interface with tabs."""
+#     with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
+#         gr.Markdown("# Advanced Haptics QA System")
+#         gr.Markdown("Ask questions about Haptics and upload PDFs to expand the knowledge base.")
         
-        for pdf_file in pdf_files:
-            # Get the filename and check if it was previously processed
-            filename = Path(pdf_file.name).name
-            if filename in processed_pdfs:
-                skipped_files += 1
-                continue
+#         # PDF Upload Section
+#         with gr.Row():
+#             pdf_upload = gr.Files(
+#                 label="Upload PDF Documents",
+#                 file_types=[".pdf"],
+#                 file_count="multiple"
+#             )
+#         upload_status = gr.Textbox(label="Upload Status", interactive=False)
+        
+#         # Main Interface with Tabs
+#         with gr.Tabs() as tabs:
+#             # Standard RAG Tab
+#             with gr.TabItem("Standard RAG"):
+#                 with gr.Row():
+#                     standard_input = gr.Textbox(
+#                         label="Enter your question:",
+#                         placeholder="Type your haptics-related question here...",
+#                         lines=2
+#                     )
+#                     standard_submit = gr.Button("Send", variant="primary")
+#                     standard_clear = gr.Button("Clear", variant="secondary")
                 
-            chunks = process_pdf(pdf_file)
-            add_chunks_to_collection(chunks, collection)
-            total_chunks += len(chunks)
-            newly_processed.add(filename)
+#                 with gr.Row():
+#                     standard_context = gr.Textbox(
+#                         label="Retrieved Context",
+#                         lines=10,
+#                         interactive=False
+#                     )
+#                     standard_response = gr.Textbox(
+#                         label="Standard RAG Response",
+#                         lines=10,
+#                         interactive=False
+#                     )
+            
+#             # Enhanced RAG Tab
+#             with gr.TabItem("Enhanced RAG"):
+#                 with gr.Row():
+#                     enhanced_input = gr.Textbox(
+#                         label="Enter your question:",
+#                         placeholder="Type your haptics-related question here...",
+#                         lines=2
+#                     )
+#                     enhanced_submit = gr.Button("Send", variant="primary")
+#                     enhanced_clear = gr.Button("Clear", variant="secondary")
+                
+#                 with gr.Row():
+#                     enhanced_context = gr.Textbox(
+#                         label="Enhanced Retrieved Context",
+#                         lines=10,
+#                         interactive=False
+#                     )
+#                     enhanced_response = gr.Textbox(
+#                         label="Enhanced RAG Response",
+#                         lines=10,
+#                         interactive=False
+#                     )
+            
+#             # GPT Tab
+#             with gr.TabItem("GPT-4"):
+#                 with gr.Row():
+#                     gpt_input = gr.Textbox(
+#                         label="Enter your question:",
+#                         placeholder="Type your haptics-related question here...",
+#                         lines=2
+#                     )
+#                     gpt_submit = gr.Button("Send", variant="primary")
+#                     gpt_clear = gr.Button("Clear", variant="secondary")
+                
+#                 with gr.Row():
+#                     gpt_context = gr.Textbox(
+#                         label="Retrieved Context",
+#                         lines=10,
+#                         interactive=False
+#                     )
+#                     gpt_response = gr.Textbox(
+#                         label="GPT-4 Response",
+#                         lines=10,
+#                         interactive=False
+#                     )
+            
+#             # Claude Tab
+#             with gr.TabItem("Claude"):
+#                 with gr.Row():
+#                     claude_input = gr.Textbox(
+#                         label="Enter your question:",
+#                         placeholder="Type your haptics-related question here...",
+#                         lines=2
+#                     )
+#                     claude_submit = gr.Button("Send", variant="primary")
+#                     claude_clear = gr.Button("Clear", variant="secondary")
+                
+#                 with gr.Row():
+#                     claude_context = gr.Textbox(
+#                         label="Retrieved Context",
+#                         lines=10,
+#                         interactive=False
+#                     )
+#                     claude_response = gr.Textbox(
+#                         label="Claude Response",
+#                         lines=10,
+#                         interactive=False
+#                     )
+
+#         # Event Handlers
+#         pdf_upload.change(
+#             qa_system.handle_pdf_upload,
+#             inputs=[pdf_upload],
+#             outputs=[upload_status]
+#         )
+
+#         # Standard RAG handlers
+#         async def handle_standard_query(message):
+#             try:
+#                 context, response = await qa_system.process_query(message)
+#                 return context, response, ""
+#             except Exception as e:
+#                 logger.error(f"Error in standard query handler: {e}")
+#                 return str(e), str(e), ""
+
+#         standard_input.submit(
+#             handle_standard_query,
+#             inputs=[standard_input],
+#             outputs=[standard_context, standard_response, standard_input]
+#         )
+#         standard_submit.click(
+#             handle_standard_query,
+#             inputs=[standard_input],
+#             outputs=[standard_context, standard_response, standard_input]
+#         )
+
+#         # Enhanced RAG handlers
+#         async def handle_enhanced_query(message):
+#             try:
+#                 context, response = await qa_system.process_enhanced_query(message)
+#                 return context, response, ""
+#             except Exception as e:
+#                 logger.error(f"Error in enhanced query handler: {e}")
+#                 return str(e), str(e), ""
+
+#         enhanced_input.submit(
+#             handle_enhanced_query,
+#             inputs=[enhanced_input],
+#             outputs=[enhanced_context, enhanced_response, enhanced_input]
+#         )
+#         enhanced_clear.click(lambda: "", outputs=[enhanced_input])
+
+#         # GPT handlers
+#         async def handle_gpt_query(message):
+#             context, _ = await qa_system.process_query(message)
+#             response = await qa_system.process_gpt_query(message, context)
+#             return context, response, ""
+
+#         gpt_input.submit(
+#             handle_gpt_query,
+#             inputs=[gpt_input],
+#             outputs=[gpt_context, gpt_response, gpt_input]
+#         )
+#         gpt_submit.click(
+#             handle_gpt_query,
+#             inputs=[gpt_input],
+#             outputs=[gpt_context, gpt_response, gpt_input]
+#         )
+#         gpt_clear.click(lambda: "", outputs=[gpt_input])
+
+#         # Claude handlers
+#         async def handle_claude_query(message):
+#             context, _ = await qa_system.process_query(message)
+#             response = await qa_system.process_claude_query(message, context)
+#             return context, response, ""
+
+#         claude_input.submit(
+#             handle_claude_query,
+#             inputs=[claude_input],
+#             outputs=[claude_context, claude_response, claude_input]
+#         )
+#         claude_submit.click(
+#             handle_claude_query,
+#             inputs=[claude_input],
+#             outputs=[claude_context, claude_response, claude_input]
+#         )
+#         claude_clear.click(lambda: "", outputs=[claude_input])
+
+#     return demo
+
+def create_gradio_interface(qa_system: HapticsQA):
+    """Create and configure the Gradio interface with tabs and shared context."""
+    with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
+        gr.Markdown("# Advanced Haptics QA System")
+        gr.Markdown("Ask questions about Haptics and upload PDFs to expand the knowledge base.")
         
-        # Update and save the processed PDFs list
-        processed_pdfs.update(newly_processed)
-        save_processed_pdfs(processed_pdfs)
+        # PDF Upload Section
+        with gr.Row():
+            pdf_upload = gr.Files(
+                label="Upload PDF Documents",
+                file_types=[".pdf"],
+                file_count="multiple"
+            )
+        upload_status = gr.Textbox(label="Upload Status", interactive=False)
         
-        # Prepare status message
-        status_parts = []
-        if newly_processed:
-            status_parts.append(f"Successfully processed {len(newly_processed)} new PDF(s). Added {total_chunks} text chunks to the database.")
-        if skipped_files > 0:
-            status_parts.append(f"Skipped {skipped_files} previously processed file(s).")
+        # Query Input and Shared Context Section
+        with gr.Row():
+            query_input = gr.Textbox(
+                label="Enter your question:",
+                placeholder="Type your haptics-related question here...",
+                lines=2
+            )
+            submit_button = gr.Button("Send", variant="primary")
+            clear_button = gr.Button("Clear", variant="secondary")
         
-        return " ".join(status_parts) or "No new files to process."
-    except Exception as e:
-        return f"Error processing PDFs: {str(e)}"
-
-# Initialize the database and collection at startup
-client, collection = initialize_database()
-
-
-
-"""
-Following section is the creating of web UI using gradio library
-"""
-with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
-    gr.Markdown("# Llama 3.2 Haptics QA System")
-    gr.Markdown("Ask questions about Haptics and upload PDFs to expand the knowledge base.")
-    
-    with gr.Row():
-        pdf_upload = gr.Files(
-            label="Upload PDF Documents",
-            file_types=[".pdf"],
-            file_count="multiple"
+        # Shared Context Display
+        shared_context = gr.Textbox(
+            label="Retrieved Context",
+            lines=8,
+            interactive=False
         )
-    
-    upload_status = gr.Textbox(
-        label="Upload Status",
-        interactive=False
-    )
-    
-    with gr.Row():
-        input_text = gr.Textbox(
-            label="Enter your question:",
-            placeholder="Type your haptics-related question here...",
-            lines=2
-        )
-        submit_btn = gr.Button("Send", variant="primary", size="sm")
-        clear_btn = gr.Button("Clear", variant="secondary", size="sm")
-
-    with gr.Row():
-        with gr.Column():
-            with gr.Group():
-                context_box = gr.Textbox(
-                    label="Retrieved Context",
-                    lines=20,
-                    interactive=False,
-                    visible=True,
-                    max_lines=20,
-                )
         
-        with gr.Column():
-            with gr.Group():
-                rag_response_box = gr.Textbox(
-                    label="RAG Response",
-                    lines=20,
-                    interactive=False,
-                    visible=True,
-                    max_lines=20,
+        # Response Tabs
+        with gr.Tabs() as tabs:
+            with gr.TabItem("Standard RAG"):
+                standard_response = gr.Textbox(
+                    label="Standard RAG Response",
+                    lines=8,
+                    interactive=False
                 )
-    
-    # Event handlers
-    pdf_upload.change(
-        handle_pdf_upload,
-        inputs=[pdf_upload],
-        outputs=[upload_status]
-    )
-    
-    input_text.submit(
-        process_query_and_clear,
-        inputs=[input_text],
-        outputs=[context_box, rag_response_box, input_text]
-    )
+            
+            with gr.TabItem("Enhanced RAG"):
+                enhanced_response = gr.Textbox(
+                    label="Enhanced RAG Response",
+                    lines=8,
+                    interactive=False
+                )
+            
+            with gr.TabItem("GPT-4"):
+                gpt_response = gr.Textbox(
+                    label="GPT-4 Response",
+                    lines=8,
+                    interactive=False
+                )
+            
+            with gr.TabItem("Claude"):
+                claude_response = gr.Textbox(
+                    label="Claude Response",
+                    lines=8,
+                    interactive=False
+                )
 
-    submit_btn.click(
-        process_query_and_clear,
-        inputs=[input_text],
-        outputs=[context_box, rag_response_box, input_text]
-    )
-    
-    clear_btn.click(lambda: "", inputs=[], outputs=[input_text])
+        async def process_all_queries(message):
+            try:
+                # Get initial context using standard RAG
+                context, standard_result = await qa_system.process_query(message)
+                
+                # Process with all models using the same context
+                enhanced_task = qa_system.process_enhanced_query(message)
+                gpt_task = qa_system.process_gpt_query(message, context)
+                claude_task = qa_system.process_claude_query(message, context)
+                
+                # Run remaining tasks concurrently
+                enhanced_results, gpt_result, claude_result = await asyncio.gather(
+                    enhanced_task,
+                    gpt_task,
+                    claude_task,
+                    return_exceptions=True
+                )
+                
+                # Handle results and exceptions
+                def get_result(result):
+                    if isinstance(result, Exception):
+                        return f"Error: {str(result)}"
+                    if isinstance(result, tuple):
+                        return result[1]  # Get response part of tuple
+                    return str(result)
+                
+                enhanced_response = get_result(enhanced_results)
+                gpt_response = get_result(gpt_result)
+                claude_response = get_result(claude_result)
+                
+                return (
+                    context,          # Shared context
+                    standard_result,  # Standard RAG response
+                    enhanced_response,# Enhanced RAG response
+                    gpt_response,     # GPT-4 response
+                    claude_response,  # Claude response
+                    ""               # Clear input
+                )
+            except Exception as e:
+                error_msg = f"Error processing queries: {str(e)}"
+                return (error_msg,) * 5 + ("",)
 
+        # Event Handlers
+        pdf_upload.change(
+            qa_system.handle_pdf_upload,
+            inputs=[pdf_upload],
+            outputs=[upload_status]
+        )
+
+        # Main query handler
+        submit_button.click(
+            process_all_queries,
+            inputs=[query_input],
+            outputs=[
+                shared_context,
+                standard_response,
+                enhanced_response,
+                gpt_response,
+                claude_response,
+                query_input
+            ]
+        )
+        
+        # Also trigger on Enter key
+        query_input.submit(
+            process_all_queries,
+            inputs=[query_input],
+            outputs=[
+                shared_context,
+                standard_response,
+                enhanced_response,
+                gpt_response,
+                claude_response,
+                query_input
+            ]
+        )
+        
+        # Clear button handler
+        clear_button.click(
+            lambda: "",
+            outputs=[query_input]
+        )
+
+    return demo
 if __name__ == "__main__":
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Initialize the QA system and launch the interface
+    qa_system = HapticsQA()
+    demo = create_gradio_interface(qa_system)
+    demo.queue()  # Enable queuing for async operations
     demo.launch(share=True)
