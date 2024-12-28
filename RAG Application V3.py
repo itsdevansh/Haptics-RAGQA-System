@@ -29,8 +29,7 @@ from dotenv import load_dotenv
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
-# Device setup if MacOS
+
 if torch.backends.mps.is_available():
     device = torch.device("mps")
     print('mps is used.')
@@ -209,79 +208,72 @@ class BedrockClient:
     """Handles AWS Bedrock API interactions."""
     def __init__(self):
         self.bedrock_runtime = boto3.client(
-            service_name='bedrock-runtime',
-            region_name='us-east-1'  # Update with your preferred region
+            'bedrock-runtime',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name='us-east-1'  # Fixed region format
         )
         self.logger = logging.getLogger(__name__)
-
     async def invoke_claude(self, message: str, context: str) -> str:
         """Process query using Claude model via AWS Bedrock."""
         try:
             prompt = f"Context: {context}\n\nQuestion: {message}\n\nProvide a clear and concise answer based on the context provided."
-            
             body = json.dumps({
-                {
-  "modelId": "anthropic.claude-3-5-sonnet-20241022-v2:0",
-  "contentType": "application/json",
-  "accept": "application/json",
-  "body": {
-    "anthropic_version": "bedrock-2023-05-31",
-    "max_tokens": 200,
-    "top_k": 250,
-    "stop_sequences": [],
-    "temperature": 1,
-    "top_p": 0.999,
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "text",
-            "text": prompt
-          }
-        ]
-      }
-    ]
-  }
-}
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1000,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ]
             })
 
             response = self.bedrock_runtime.invoke_model(
-                modelId='anthropic.claude-3',  # Use appropriate model ID
+                modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
+                contentType="application/json",
+                accept="application/json",
                 body=body
             )
-            
+
             response_body = json.loads(response['body'].read())
-            return response_body['content'][0]['text']
-            
+            return response_body["content"][0]['text']
+
         except Exception as e:
             self.logger.error(f"Error in Bedrock Claude processing: {e}")
             return f"An error occurred: {str(e)}"
-
-    async def invoke_gpt(self, message: str, context: str) -> str:
-        """Process query using GPT model via AWS Bedrock."""
+    
+    
+    async def invoke_mistral(self, message: str, context: str) -> str:
+        """Process query using mistral model via AWS Bedrock."""
         try:
-            prompt = f"Context: {context}\n\nQuestion: {message}"
-            
+            prompt = f"<s>[INST] Context: {context} Question: {message} [/INST]"
+
             body = json.dumps({
                 "prompt": prompt,
-                "max_tokens": 500,
-                "temperature": 0.7,
-                "top_p": 1,
-                "stop_sequences": [],
-                "return_likelihoods": "NONE"
+                "max_tokens": 200,
+                "temperature": 0.5,
+                "top_p": 0.9,
+                "top_k": 50
             })
 
             response = self.bedrock_runtime.invoke_model(
-                modelId='amazon.titan-text-express-v1',  # Use appropriate model ID
+                modelId='mistral.mistral-7b-instruct-v0:2',  # Use appropriate model ID
+                contentType="application/json",
+                accept="application/json",
                 body=body
             )
-            
+
             response_body = json.loads(response['body'].read())
-            return response_body['outputText']
-            
+            return response_body['outputs'][0]['text']
+
         except Exception as e:
-            self.logger.error(f"Error in Bedrock GPT processing: {e}")
+            self.logger.error(f"Error in Bedrock mistral processing: {e}")
             return f"An error occurred: {str(e)}"
         
 class HapticsQA:
@@ -349,9 +341,9 @@ class HapticsQA:
             error_message = f"An error occurred: {str(e)}"
             return error_message, error_message
 
-    async def process_gpt_query(self, message: str, context: str) -> str:
-        """Process query using GPT model via AWS Bedrock."""
-        return await self.bedrock_client.invoke_gpt(message, context)
+    async def process_mistral_query(self, message: str, context: str) -> str:
+        """Process query using mistral model via AWS Bedrock."""
+        return await self.bedrock_client.invoke_mistral(message, context)
 
     async def process_claude_query(self, message: str, context: str) -> str:
         """Process query using Claude model via AWS Bedrock."""
@@ -480,195 +472,7 @@ The question is =
             error_message = f"An error occurred: {str(e)}"
             return error_message, error_message
 
-# def create_gradio_interface(qa_system: HapticsQA):
-#     """Create and configure the Gradio interface with tabs."""
-#     with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
-#         gr.Markdown("# Advanced Haptics QA System")
-#         gr.Markdown("Ask questions about Haptics and upload PDFs to expand the knowledge base.")
-        
-#         # PDF Upload Section
-#         with gr.Row():
-#             pdf_upload = gr.Files(
-#                 label="Upload PDF Documents",
-#                 file_types=[".pdf"],
-#                 file_count="multiple"
-#             )
-#         upload_status = gr.Textbox(label="Upload Status", interactive=False)
-        
-#         # Main Interface with Tabs
-#         with gr.Tabs() as tabs:
-#             # Standard RAG Tab
-#             with gr.TabItem("Standard RAG"):
-#                 with gr.Row():
-#                     standard_input = gr.Textbox(
-#                         label="Enter your question:",
-#                         placeholder="Type your haptics-related question here...",
-#                         lines=2
-#                     )
-#                     standard_submit = gr.Button("Send", variant="primary")
-#                     standard_clear = gr.Button("Clear", variant="secondary")
-                
-#                 with gr.Row():
-#                     standard_context = gr.Textbox(
-#                         label="Retrieved Context",
-#                         lines=10,
-#                         interactive=False
-#                     )
-#                     standard_response = gr.Textbox(
-#                         label="Standard RAG Response",
-#                         lines=10,
-#                         interactive=False
-#                     )
-            
-#             # Enhanced RAG Tab
-#             with gr.TabItem("Enhanced RAG"):
-#                 with gr.Row():
-#                     enhanced_input = gr.Textbox(
-#                         label="Enter your question:",
-#                         placeholder="Type your haptics-related question here...",
-#                         lines=2
-#                     )
-#                     enhanced_submit = gr.Button("Send", variant="primary")
-#                     enhanced_clear = gr.Button("Clear", variant="secondary")
-                
-#                 with gr.Row():
-#                     enhanced_context = gr.Textbox(
-#                         label="Enhanced Retrieved Context",
-#                         lines=10,
-#                         interactive=False
-#                     )
-#                     enhanced_response = gr.Textbox(
-#                         label="Enhanced RAG Response",
-#                         lines=10,
-#                         interactive=False
-#                     )
-            
-#             # GPT Tab
-#             with gr.TabItem("GPT-4"):
-#                 with gr.Row():
-#                     gpt_input = gr.Textbox(
-#                         label="Enter your question:",
-#                         placeholder="Type your haptics-related question here...",
-#                         lines=2
-#                     )
-#                     gpt_submit = gr.Button("Send", variant="primary")
-#                     gpt_clear = gr.Button("Clear", variant="secondary")
-                
-#                 with gr.Row():
-#                     gpt_context = gr.Textbox(
-#                         label="Retrieved Context",
-#                         lines=10,
-#                         interactive=False
-#                     )
-#                     gpt_response = gr.Textbox(
-#                         label="GPT-4 Response",
-#                         lines=10,
-#                         interactive=False
-#                     )
-            
-#             # Claude Tab
-#             with gr.TabItem("Claude"):
-#                 with gr.Row():
-#                     claude_input = gr.Textbox(
-#                         label="Enter your question:",
-#                         placeholder="Type your haptics-related question here...",
-#                         lines=2
-#                     )
-#                     claude_submit = gr.Button("Send", variant="primary")
-#                     claude_clear = gr.Button("Clear", variant="secondary")
-                
-#                 with gr.Row():
-#                     claude_context = gr.Textbox(
-#                         label="Retrieved Context",
-#                         lines=10,
-#                         interactive=False
-#                     )
-#                     claude_response = gr.Textbox(
-#                         label="Claude Response",
-#                         lines=10,
-#                         interactive=False
-#                     )
 
-#         # Event Handlers
-#         pdf_upload.change(
-#             qa_system.handle_pdf_upload,
-#             inputs=[pdf_upload],
-#             outputs=[upload_status]
-#         )
-
-#         # Standard RAG handlers
-#         async def handle_standard_query(message):
-#             try:
-#                 context, response = await qa_system.process_query(message)
-#                 return context, response, ""
-#             except Exception as e:
-#                 logger.error(f"Error in standard query handler: {e}")
-#                 return str(e), str(e), ""
-
-#         standard_input.submit(
-#             handle_standard_query,
-#             inputs=[standard_input],
-#             outputs=[standard_context, standard_response, standard_input]
-#         )
-#         standard_submit.click(
-#             handle_standard_query,
-#             inputs=[standard_input],
-#             outputs=[standard_context, standard_response, standard_input]
-#         )
-
-#         # Enhanced RAG handlers
-#         async def handle_enhanced_query(message):
-#             try:
-#                 context, response = await qa_system.process_enhanced_query(message)
-#                 return context, response, ""
-#             except Exception as e:
-#                 logger.error(f"Error in enhanced query handler: {e}")
-#                 return str(e), str(e), ""
-
-#         enhanced_input.submit(
-#             handle_enhanced_query,
-#             inputs=[enhanced_input],
-#             outputs=[enhanced_context, enhanced_response, enhanced_input]
-#         )
-#         enhanced_clear.click(lambda: "", outputs=[enhanced_input])
-
-#         # GPT handlers
-#         async def handle_gpt_query(message):
-#             context, _ = await qa_system.process_query(message)
-#             response = await qa_system.process_gpt_query(message, context)
-#             return context, response, ""
-
-#         gpt_input.submit(
-#             handle_gpt_query,
-#             inputs=[gpt_input],
-#             outputs=[gpt_context, gpt_response, gpt_input]
-#         )
-#         gpt_submit.click(
-#             handle_gpt_query,
-#             inputs=[gpt_input],
-#             outputs=[gpt_context, gpt_response, gpt_input]
-#         )
-#         gpt_clear.click(lambda: "", outputs=[gpt_input])
-
-#         # Claude handlers
-#         async def handle_claude_query(message):
-#             context, _ = await qa_system.process_query(message)
-#             response = await qa_system.process_claude_query(message, context)
-#             return context, response, ""
-
-#         claude_input.submit(
-#             handle_claude_query,
-#             inputs=[claude_input],
-#             outputs=[claude_context, claude_response, claude_input]
-#         )
-#         claude_submit.click(
-#             handle_claude_query,
-#             inputs=[claude_input],
-#             outputs=[claude_context, claude_response, claude_input]
-#         )
-#         claude_clear.click(lambda: "", outputs=[claude_input])
-
-#     return demo
 
 def create_gradio_interface(qa_system: HapticsQA):
     """Create and configure the Gradio interface with tabs and shared context."""
@@ -718,9 +522,9 @@ def create_gradio_interface(qa_system: HapticsQA):
                     interactive=False
                 )
             
-            with gr.TabItem("GPT-4"):
-                gpt_response = gr.Textbox(
-                    label="GPT-4 Response",
+            with gr.TabItem("mistral"):
+                mistral_response = gr.Textbox(
+                    label="mistral Response",
                     lines=8,
                     interactive=False
                 )
@@ -739,13 +543,13 @@ def create_gradio_interface(qa_system: HapticsQA):
                 
                 # Process with all models using the same context
                 enhanced_task = qa_system.process_enhanced_query(message)
-                gpt_task = qa_system.process_gpt_query(message, context)
+                mistral_task = qa_system.process_mistral_query(message, context)
                 claude_task = qa_system.process_claude_query(message, context)
                 
                 # Run remaining tasks concurrently
-                enhanced_results, gpt_result, claude_result = await asyncio.gather(
+                enhanced_results, mistral_result, claude_result = await asyncio.gather(
                     enhanced_task,
-                    gpt_task,
+                    mistral_task,
                     claude_task,
                     return_exceptions=True
                 )
@@ -759,14 +563,14 @@ def create_gradio_interface(qa_system: HapticsQA):
                     return str(result)
                 
                 enhanced_response = get_result(enhanced_results)
-                gpt_response = get_result(gpt_result)
+                mistral_response = get_result(mistral_result)
                 claude_response = get_result(claude_result)
                 
                 return (
                     context,          # Shared context
                     standard_result,  # Standard RAG response
                     enhanced_response,# Enhanced RAG response
-                    gpt_response,     # GPT-4 response
+                    mistral_response,     # mistral-4 response
                     claude_response,  # Claude response
                     ""               # Clear input
                 )
@@ -789,7 +593,7 @@ def create_gradio_interface(qa_system: HapticsQA):
                 shared_context,
                 standard_response,
                 enhanced_response,
-                gpt_response,
+                mistral_response,
                 claude_response,
                 query_input
             ]
@@ -803,7 +607,7 @@ def create_gradio_interface(qa_system: HapticsQA):
                 shared_context,
                 standard_response,
                 enhanced_response,
-                gpt_response,
+                mistral_response,
                 claude_response,
                 query_input
             ]
